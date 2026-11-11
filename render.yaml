@@ -1,0 +1,25 @@
+# Render Blueprint — trial server ONLY (NOT the whole app)
+#
+# Service: sorakanji-trial-lesson — runs ONLY the makeLesson function
+# (paste a YouTube link -> shadowing lesson) on Render's free tier.
+# The Firebase code in functions/ is untouched; the server reuses its
+# pipeline via require('../functions/src/pipeline.js').
+#
+# IMPORTANT — why the build installs functions/ too:
+#   pipeline.js requires kuromoji + @google-cloud/translate, which live in
+#   ../functions/node_modules (Node resolves them from the pipeline file's
+#   location, NOT from trial-server/node_modules). The build step below
+#   installs both package.json files so those modules exist at runtime.
+#   Render clones the WHOLE repo, so ../functions is present at runtime;
+#   rootDir only changes where the build/start commands run.
+services:
+  - type: web
+    name: sorakanji-trial-lesson
+    runtime: node
+    plan: free
+    rootDir: trial-server
+    buildCommand: npm install && (cd ../functions && npm install --legacy-peer-deps)
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
