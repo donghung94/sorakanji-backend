@@ -1,0 +1,1 @@
+{"dependencies":{"express":"^4.21.2"},"description":"Trial server (Render free) — only the makeLesson lesson builder, NOT the whole app","engines":{"node":"20.x"},"main":"server.js","name":"sorakanji-trial-server","private":true,"scripts":{"start":"node server.js","test":"node test-local.js"},"version":"1.0.0"}
