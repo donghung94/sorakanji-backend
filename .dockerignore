@@ -1,0 +1,9 @@
+# Keep the Docker build context small — the image installs dependencies
+# fresh (see Dockerfile), so nothing below is needed at build time.
+node_modules/
+.git/
+*.md
+functions/test/
+tools/
+trial-server/test-local.js
+render.yaml
