@@ -43,6 +43,7 @@ const { parseJson3 } = require('../src/parse');
 const { kanaToRomaji } = require('../src/romaji');
 const { annotateLine } = require('../src/furigana');
 const { buildLessonFromFetched } = require('../src/pipeline');
+const { generateNotes } = require('../src/gemini');
 
 const FIX = path.join(__dirname, 'fixtures');
 const results = [];
@@ -334,6 +335,56 @@ async function main() {
     else record(7, `romaji ${kana}`, 'FAIL', `got ${got}, want ${want}`);
   }
   record(7, `romaji units ${romaPass}/${romaCases.length}`, romaPass === romaCases.length ? 'PASS' : 'FAIL');
+
+  // ---------------------------------------------------------- Step 8: notes chunking
+  // Regression test for 2026-11-13: a 42-line lesson got 0/42 notes because
+  // generateNotes asked for all notes in ONE call and threw everything away
+  // on any length mismatch. Now it chunks (12/call), tolerates a short
+  // array (pads ''), and falls back across models per chunk.
+  section('Step 8 — generateNotes chunking + mismatch tolerance (mocked fetch)');
+  {
+    const realFetch = global.fetch;
+    const realKey = process.env.GEMINI_API_KEY;
+    process.env.GEMINI_API_KEY = 'test-key';
+    let calls = 0;
+    global.fetch = async (url, options) => {
+      calls += 1;
+      const body = JSON.parse(options.body);
+      const prompt = body.contents[0].parts[0].text;
+      const n = (prompt.match(/^\d+\. /gm) || []).length;
+      const model = String(url).includes('gemini-3-flash-preview') ? 'preview' : 'other';
+      // Chunk 3 (1 item): 503 on the first model, success on fallback.
+      if (n === 1 && model === 'preview') {
+        return { ok: false, status: 503, json: async () => ({ error: { message: 'high demand' } }) };
+      }
+      // Chunk 2 (12 items): model returns only 10 notes (mismatch -> pad '').
+      const ret = n === 12 && calls > 1 ? 10 : n;
+      const arr = Array.from({ length: ret }, (_, i) => `note-${calls}-${i}`);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ candidates: [{ content: { parts: [{ text: JSON.stringify(arr) }] } }] }),
+      };
+    };
+    try {
+      const texts = Array.from({ length: 25 }, (_, i) => `日本語の文${i + 1}です。`);
+      const notes = await generateNotes(texts);
+      const okLen = Array.isArray(notes) && notes.length === 25;
+      const okChunk1 = notes && notes.slice(0, 12).every((s) => s.startsWith('note-'));
+      const okPad = notes && notes[22] === '' && notes[23] === '' && notes[21].startsWith('note-');
+      const okFallback = notes && notes[24].startsWith('note-');
+      const okCalls = calls === 4; // 3 chunks + 1 retry on chunk 3
+      const ok = okLen && okChunk1 && okPad && okFallback && okCalls;
+      record(8, 'notes chunked 25 -> 25 (pad + model fallback)', ok ? 'PASS' : 'FAIL',
+        `len=${notes && notes.length}, calls=${calls}, pad=${okPad}, fallback=${okFallback}`);
+    } catch (e) {
+      record(8, 'notes chunked 25 -> 25 (pad + model fallback)', 'FAIL', e.message);
+    } finally {
+      global.fetch = realFetch;
+      if (realKey === undefined) delete process.env.GEMINI_API_KEY;
+      else process.env.GEMINI_API_KEY = realKey;
+    }
+  }
 
   // ---------------------------------------------------------- Summary
   section('Summary');
