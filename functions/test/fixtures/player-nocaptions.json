@@ -1,0 +1,1 @@
+{"_fixture":"Mock Innertube player response for a video with NO captions at all (playable, but no captions object). Used to test the NO_CAPTIONS error path.","playabilityStatus":{"status":"OK"},"videoDetails":{"lengthSeconds":"210","title":"Music video without subtitles","videoId":"NOCAP-TEST"}}
