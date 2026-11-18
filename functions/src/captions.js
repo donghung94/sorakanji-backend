@@ -1,10 +1,19 @@
 'use strict';
 /**
- * captions.js — fetch a video's Japanese caption track from YouTube, server-side.
+ * Captions.js — fetch a video's Japanese caption track from YouTube, server-side.
  *
- * PRIMARY PATH (no API key, no login): YouTube Innertube `player` endpoint
- * with the WEB client -> `captions.playerCaptionsTracklistRenderer.captionTracks`
- * -> fetch the track's baseUrl with `fmt=json3`.
+ * PRIMARY PATH (no API key, no login): YouTube Innertube `player` endpoint.
+ * Tries several clients in order — ANDROID first, then IOS, WEB, TVHTML5.
+ * NOTE (2026-11-12): from a dev-machine IP ANDROID returns OK, but from
+ * Google Cloud Functions egress IPs ALL FOUR clients return LOGIN_REQUIRED
+ * (bot-check) — verified live with per-client diagnostics. So on the
+ * deployed function the primary path always fails and the GEMINI FALLBACK
+ * below is the path that actually serves lessons.
+ *
+ * GEMINI FALLBACK (src/gemini.js, needs the GEMINI_API_KEY secret): when
+ * the player is bot-checked or the video has no Japanese track, transcribe
+ * the audio with the Gemini API (it takes a YouTube URL directly). Works
+ * for videos without any captions. See gemini.js for verification notes.
  *
  * Why not the browser: the app (static PWA) cannot call these endpoints
  * directly — YouTube answers cross-origin browser requests with CORS errors
@@ -59,14 +68,21 @@ async function fetchJson(url, options, timeoutMs = 15000) {
   }
 }
 
-/** Call the Innertube player endpoint (WEB client) and return the raw player response. */
-async function fetchPlayerResponse(videoId) {
+/** Innertube clients to try, in order. ANDROID first: it is not bot-checked
+ * from datacenter IPs the way WEB/TV are (verified 2026-11-12). */
+const INNERTUBE_CLIENTS = [
+  { clientName: 'ANDROID', clientVersion: '20.10.38', androidSdkVersion: 30 },
+  { clientName: 'IOS', clientVersion: '20.10.38', deviceModel: 'iPhone16,2' },
+  { clientName: 'WEB', clientVersion: '2.20250728.00.00', clientScreen: 'WATCH' },
+  { clientName: 'TVHTML5', clientVersion: '7.20250212.00.00' },
+];
+
+/** Call the Innertube player endpoint with one client and return the raw player response. */
+async function fetchPlayerWithClient(videoId, client) {
   const body = {
     context: {
       client: {
-        clientName: 'WEB',
-        clientVersion: '2.20250728.00.00',
-        clientScreen: 'WATCH',
+        ...client,
         hl: 'ja',
         gl: 'JP',
         timeZone: 'Asia/Tokyo',
@@ -87,31 +103,50 @@ async function fetchPlayerResponse(videoId) {
     racyCheckOk: true,
     contentCheckOk: true,
   };
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    Origin: 'https://www.youtube.com',
+  };
   // One retry on transient network failure.
   try {
-    return await fetchJson(INNERTUBE_PLAYER_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        Origin: 'https://www.youtube.com',
-      },
-      body: JSON.stringify(body),
-    });
+    return await fetchJson(INNERTUBE_PLAYER_URL, { method: 'POST', headers, body: JSON.stringify(body) });
   } catch (err) {
     await sleep(800);
-    return await fetchJson(INNERTUBE_PLAYER_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        Origin: 'https://www.youtube.com',
-      },
-      body: JSON.stringify(body),
-    });
+    return await fetchJson(INNERTUBE_PLAYER_URL, { method: 'POST', headers, body: JSON.stringify(body) });
   }
+}
+
+/**
+ * Call the Innertube player endpoint, trying each client in turn until one
+ * returns a playable response. Returns the first response with
+ * playabilityStatus OK (or LIVE_STREAM_OFFLINE); if none is playable,
+ * returns the last response so the caller can report its reason.
+ */
+async function fetchPlayerResponse(videoId) {
+  let last = null;
+  const tried = [];
+  for (const client of INNERTUBE_CLIENTS) {
+    try {
+      const res = await fetchPlayerWithClient(videoId, client);
+      last = res;
+      const status = res && res.playabilityStatus ? res.playabilityStatus.status : null;
+      tried.push(`${client.clientName}=${status || 'NO_STATUS'}`);
+      if (status === 'OK' || status === 'LIVE_STREAM_OFFLINE') {
+        res._tried = tried;
+        return res;
+      }
+    } catch (err) {
+      // Network/fetch failure for this client — try the next one.
+      tried.push(`${client.clientName}=FETCH_FAIL`);
+    }
+  }
+  if (last) {
+    last._tried = tried;
+    return last;
+  }
+  throw new CaptionError('FETCH_FAILED', `Không gọi được YouTube bằng bất kỳ client nào. [thử: ${tried.join(', ')}]`);
 }
 
 /**
@@ -200,8 +235,38 @@ async function fetchWithYtDlp(videoId) {
 }
 
 /**
+ * Gemini fallback (src/gemini.js): when the Innertube path fails — either
+ * the player is bot-checked (all clients LOGIN_REQUIRED from Google Cloud
+ * egress IPs, verified 2026-11-12) or the video has no Japanese track —
+ * transcribe the audio with Gemini instead. Returns the Gemini result on
+ * success; otherwise rethrows the ORIGINAL error (the video really is
+ * unavailable / captionless — Gemini failing does not change that).
+ * Gemini overload (503/429) is reported as its own error so the user knows
+ * the video is fine and only needs to retry in a few minutes.
+ * The require() is lazy to avoid a require cycle (gemini.js imports
+ * CaptionError from this module).
+ */
+async function tryGeminiOrThrow(videoId, originalError) {
+  const { transcribeWithGemini, hasGeminiKey } = require('./gemini');
+  if (!hasGeminiKey()) throw originalError;
+  try {
+    return await transcribeWithGemini(videoId);
+  } catch (err) {
+    if (err instanceof CaptionError && err.code === 'GEMINI_OVERLOADED') {
+      throw new CaptionError(
+        'FETCH_FAILED',
+        'Máy chủ AI (Gemini) đang quá tải, thử lại sau ít phút. (YouTube cũng đang chặn máy chủ lấy phụ đề trực tiếp.)'
+      );
+    }
+    // eslint-disable-next-line no-console
+    console.warn(`[captions] Gemini fallback failed for ${videoId}:`, err && err.message);
+    throw originalError;
+  }
+}
+
+/**
  * Main entry: fetch the best Japanese caption track for a video.
- * Returns { title, durationSec, source: 'manual'|'auto', json3 }.
+ * Returns { title, durationSec, source: 'manual'|'auto'|'gemini', json3 }.
  * Throws CaptionError('VIDEO_UNAVAILABLE' | 'NO_CAPTIONS' | 'FETCH_FAILED').
  */
 async function fetchJapaneseCaptions(videoId, opts = {}) {
@@ -211,9 +276,15 @@ async function fetchJapaneseCaptions(videoId, opts = {}) {
   const status = player && player.playabilityStatus ? player.playabilityStatus.status : null;
   if (status && status !== 'OK' && status !== 'LIVE_STREAM_OFFLINE') {
     const reason = player.playabilityStatus.reason || '';
-    throw new CaptionError(
-      'VIDEO_UNAVAILABLE',
-      `Video này không phát được (${reason || status}). Kiểm tra lại link — có thể video đã bị xóa, riêng tư hoặc giới hạn độ tuổi.`
+    const tried = Array.isArray(player._tried) && player._tried.length > 0
+      ? ` [thử: ${player._tried.join(', ')}]`
+      : '';
+    return tryGeminiOrThrow(
+      videoId,
+      new CaptionError(
+        'VIDEO_UNAVAILABLE',
+        `Video này không phát được (${reason || status}). Kiểm tra lại link — có thể video đã bị xóa, riêng tư hoặc giới hạn độ tuổi.${tried}`
+      )
     );
   }
 
@@ -234,9 +305,12 @@ async function fetchJapaneseCaptions(videoId, opts = {}) {
     // No Japanese track in the player response — try yt-dlp before giving up.
     const viaYtdlp = await fetchWithYtDlp(videoId);
     if (viaYtdlp) return { title, durationSec, source: viaYtdlp.source, json3: viaYtdlp.json3 };
-    throw new CaptionError(
-      'NO_CAPTIONS',
-      'Video này không có phụ đề tiếng Nhật (cả phụ đề do người đăng tải lên lẫn phụ đề tự động). Tính năng chép lời bằng AI (Whisper) chưa có — xem README mục Phase 2.'
+    return tryGeminiOrThrow(
+      videoId,
+      new CaptionError(
+        'NO_CAPTIONS',
+        'Video này không có phụ đề tiếng Nhật (cả phụ đề do người đăng tải lên lẫn phụ đề tự động), và AI cũng không nghe được lời thoại. Thử video khác.'
+      )
     );
   }
 
