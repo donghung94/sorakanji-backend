@@ -51,6 +51,7 @@ const { defineSecret } = require('firebase-functions/params');
 const { buildLesson, buildLessonFree, InputError } = require('./src/pipeline');
 const { VideoIdError } = require('./src/videoId');
 const { CaptionError } = require('./src/captions');
+const { expectedPrice, toMillis } = require('./src/pricing');
 
 // Gemini API key (Secret Manager) — powers the Gemini transcription fallback
 // in src/gemini.js. Set with: firebase functions:secrets:set GEMINI_API_KEY
@@ -153,7 +154,9 @@ exports.makeLessonFromVideoFree = functionsV1
 //
 // Returns { outcome, uid?, plan? } where outcome is one of:
 //   'activated' | 'already_paid' | 'order_not_found' |
-//   'amount_mismatch' | 'invalid_state'
+//   'amount_mismatch' | 'invalid_amount' | 'invalid_state'
+// 'invalid_amount': order.amount không khớp bảng giá tại thời điểm tạo đơn
+//   (src/pricing.js) — đơn tự khai giá rẻ không được kích hoạt (vá B-1).
 // `extra` (optional) adds fields to the order update (e.g. SePay ids).
 // Throws on Firestore errors (callers map to 500).
 // ---------------------------------------------------------------------------
@@ -178,6 +181,13 @@ async function activateOrder(db, { code, amount, ref, date, extra }) {
     }
     if (typeof order.uid !== 'string' || !order.uid) {
       return { outcome: 'invalid_state' };
+    }
+    // B-1: order.amount phải khớp bảng giá tại thời điểm tạo đơn — nếu không,
+    // đơn tự khai giá rẻ (vd Lifetime 1.000đ) vẫn kích hoạt được Premium.
+    // createdAt thiếu/không parse được thì dùng thời điểm hiện tại.
+    const createdMs = toMillis(order.createdAt) ?? Date.now();
+    if (order.amount !== expectedPrice(order.package, createdMs)) {
+      return { outcome: 'invalid_amount' };
     }
 
     const now = admin.firestore.Timestamp.now();
@@ -232,6 +242,7 @@ async function activateOrder(db, { code, amount, ref, date, extra }) {
 //   400 { error:"invalid_input" }         — bad code/amount
 //   400 { error:"invalid_state" }         — order not pending/paid
 //   400 { error:"amount_mismatch" }       — amount != order.amount (NOT activated)
+//   400 { error:"invalid_amount" }        — order.amount != bảng giá lúc tạo đơn (vá B-1)
 //   401 { error:"unauthorized" }          — wrong/missing secret
 //   404 { error:"order_not_found" }       — no such order
 //   405 { error:"method_not_allowed" }    — non-POST
@@ -303,6 +314,10 @@ exports.activatePremium = onRequest(
       }
       if (result.outcome === 'amount_mismatch') {
         res.status(400).json({ error: 'amount_mismatch' });
+        return;
+      }
+      if (result.outcome === 'invalid_amount') {
+        res.status(400).json({ error: 'invalid_amount' });
         return;
       }
       res.status(400).json({ error: 'invalid_state' });
